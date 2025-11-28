@@ -6,9 +6,9 @@
 
 <div align="left">
 |                                              최시훈                                              |
-| :----------------------------------------------------------------------------------------------: |
-|                  <img width="160px" src="https://github.com/fkdldkrhya.png" />                   |
-| [@fkdldkrhya](https://github.com/fkdldkrhya) <br> 한양대학교 ERICA 3학년<br> | 
+| :----------------------------------------------------------------------------------------------:|
+|                  <img width="160px" src="https://github.com/fkdldkrhya.png" />                  |
+| [@fkdldkrhya](https://github.com/fkdldkrhya) <br> 한양대학교 ERICA 3학년                            | 
 </div>
 
 ---
