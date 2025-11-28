@@ -4,24 +4,14 @@
 스마트 건물 안전 관리를 위해 Vision & AI 기술을 활용한 콘크리트 크랙 탐지에 관한 연구
 </div>
 
-<div align="left">
-|                                              최시훈                                              
-| :----------------------------------------------------------------------------------------------:
-|                  <img width="160px" src="https://github.com/fkdldkrhya.png" />                 
-</div>
-
----
-
 **Affiliation**
-
+- 최시훈 (CHOI SIHUN)
 - Department of Smart Convergence Engineering, Hanyang Univ. ERICA
 
 **Contact**
-
 - 📧 fkdldkrhya@hanyang.ac.kr
 
 **Research Interests**
-
 - AI
 - Computer Vision
 
