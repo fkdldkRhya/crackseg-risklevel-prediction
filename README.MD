@@ -5,9 +5,9 @@
 </div>
 
 <div align="left">
-|                                              최시훈                                              |
+|                                              최시훈                                              
 | :----------------------------------------------------------------------------------------------:
-|                  <img width="160px" src="https://github.com/fkdldkrhya.png" />                  |
+|                  <img width="160px" src="https://github.com/fkdldkrhya.png" />                 
 </div>
 
 ---
