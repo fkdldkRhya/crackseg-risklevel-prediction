@@ -1,10 +1,10 @@
 # Crack Future Risk Analysis Pipeline
 
-<div align="center">
+<div align="left">
 스마트 건물 안전 관리를 위해 Vision & AI 기술을 활용한 콘크리트 크랙 탐지에 관한 연구
 </div>
 
-<div align="center">
+<div align="left">
 
   <div
     style="
