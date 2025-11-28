@@ -70,6 +70,8 @@
     <p style="margin: 0 0 8px;">
       <strong>Affiliation</strong>
       <br/>
+      최시훈 (CHOI SIHUN)
+      <br/>
       Department of Smart Convergence Engineering, Hanyang Univ. ERICA
     </p>
     <p style="margin: 0 0 8px;">
