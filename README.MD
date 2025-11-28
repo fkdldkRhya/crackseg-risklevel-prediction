@@ -5,88 +5,10 @@
 </div>
 
 <div align="left">
-
-  <div
-    style="
-      width: 100%;
-      max-width: 480px;
-      box-sizing: border-box;
-      margin: 24px auto 32px;
-      padding: 20px 18px;
-      border-radius: 16px;
-      border: 1px solid var(--color-border-default, #e5e7eb);
-      background: var(--color-canvas-subtle, #f9fafb);
-    "
-  >
-
-<img
-    src="https://github.com/fkdldkrhya.png"
-    alt="GitHub Profile"
-    width="96"
-    style="
-      border-radius: 999px;
-      border: 2px solid var(--color-border-default, #e5e7eb);
-      display: block;
-      margin: 0 auto 12px;
-    "
-  />
-
-  <h2
-    style="
-      margin: 0 0 4px;
-      font-size: 20px;
-      line-height: 1.3;
-      color: var(--color-fg-default, #111827);
-      text-align: center;
-    "
-  >
-    Crack Future Risk Analysis Pipeline
-  </h2>
-
-  <p
-    style="
-      margin: 0 0 16px;
-      font-size: 13px;
-      line-height: 1.5;
-      color: var(--color-fg-muted, #6b7280);
-      text-align: center;
-    "
-  >
-    스마트 건물 안전 관리를 위해 Vision &amp; AI 기술을 활용한 콘크리트 크랙 탐지에 관한 연구
-  </p>
-
-  <div
-    style="
-      padding: 12px 14px;
-      border-radius: 12px;
-      border: 1px solid var(--color-border-muted, #e5e7eb);
-      background: var(--color-canvas-default, #ffffff);
-      text-align: left;
-      font-size: 13px;
-      line-height: 1.5;
-      color: var(--color-fg-default, #111827);
-    "
-  >
-    <p style="margin: 0 0 8px;">
-      <strong>Affiliation</strong>
-      <br/>
-      최시훈 (CHOI SIHUN)
-      <br/>
-      Department of Smart Convergence Engineering, Hanyang Univ. ERICA
-    </p>
-    <p style="margin: 0 0 8px;">
-      <strong>Contact</strong><br/>
-      📧 <a href="mailto:fkdldkrhya@hanyang.ac.kr">fkdldkrhya@hanyang.ac.kr</a>
-    </p>
-    <p style="margin: 0;">
-      <strong>Research Interests</strong><br/>
-      • AI<br/>
-      • Computer Vision
-    </p>
-
-  </div>
-
-  </div>
+|                                              최시훈                                              |
+| :----------------------------------------------------------------------------------------------: |
+|                  <img width="160px" src="https://github.com/fkdldkrhya.png" />                   |
+| [@fkdldkrhya](https://github.com/fkdldkrhya) <br> 한양대학교 ERICA 3학년<br> | 
 </div>
 
 ---
