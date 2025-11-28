@@ -1,0 +1,16 @@
+<학습 코드>
+python future_unet_train.py --data_root ./crackseq_dataset_multi_mono_patches/data/multi-temporal --horizon_steps 4 --epochs 50 --batch_size 8 --lr 1e-4 --save_path future_mask_unet_h4_v2.pth
+<메인 실행>
+python risklevel_prediction.py a.png --mm_per_pixel 0.05 --model_path future_mask_unet_h4_v2.pth
+
+
+
+<pip 설치>
+pip install \
+    opencv-python \
+    numpy \
+    pillow \
+    torch \
+    torchvision \
+    huggingface_hub \
+    scikit-learn
