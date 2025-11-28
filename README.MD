@@ -558,6 +558,103 @@ python risklevel_prediction.py G.png \
 이 README는 `future_unet_train.py.py`와 `risklevel_prediction.py`의 전체 동작을  
 한 번에 이해하고 재현할 수 있도록 정리한 문서입니다.
 
+## 11. 예시 출력
+```
+[INFO] Using device: mps
+
+[STEP 1/7] 입력 이미지 존재 여부 확인
+
+[STEP 2/7] 현재(now) 크랙 마스크 생성 (Vizuara UNet + GMM)
+[INFO] Loading Vizuara UNet weights from HF: Vizuara/unet-crack-segmentation/unet_weights.pth
+[INFO] UNet weights downloaded at: /Users/user/.cache/huggingface/hub/models--Vizuara--unet-crack-segmentation/snapshots/ceb5d57f750c5135edf5532fc3656d2070737cd5/unet_weights.pth
+[INFO] Image shape: 1018x680 (WxH)
+[INFO] Running Vizuara UNet inference...
+[INFO] Running GMM clustering on [prob, edge] features...
+[INFO] prob_map min=0.0000, max=0.3385
+[INFO] Fitting GMM (n_components=3) on 50000 samples...
+[INFO] cluster 0: mean_norm=0.0001, count=58580
+[INFO] cluster 1: mean_norm=0.0000, count=612238
+[INFO] cluster 2: mean_norm=0.2971, count=21422
+[INFO] Main crack cluster = 2 (mean_norm=0.2971)
+[INFO] crack_clusters = [2]
+[INFO] Saved crack mask to: out/d_now_unet_mask.png
+[INFO] Saved overlay to: out/d_now_unet_overlay.png
+
+[STEP 3/7] 현재(now) 위험도 분석
+
+=== [now] d.png ===
+w_max_mm        : 1.5788
+rho_L_per_m     : 1.4381
+length_m        : 0.0732
+D_f             : 1.3413
+area_mm2        : 44.2825
+--- Severity scores (0~1) ---
+S_w             : 1.000
+S_density       : 0.688
+S_area          : 0.044
+S_fractal       : 0.353
+S_length        : 0.122
+S_total         : 0.441
+--- Probability components (0~1) ---
+P_TipSharpness  : 0.285
+P_WidthGradient : 0.528
+P_Orientation   : 0.035  (angle=171.6°, base=0.289)
+P               : 0.283
+--- Risk (0~1) ---
+R               : 0.386, Level: B
+
+[STEP 4/7] 미래 크랙 마스크 예측 UNet 로딩
+[INFO] Loaded future-mask UNet weights from: future_mask_unet_h4_v2.pth
+
+[STEP 5/7] 미래 마스크(probability map) 예측 (타일링)
+
+[INFO] 미래 예측 요약
+  - mean_prob (평균 예측 확률)     : 0.0884
+  - fg_ratio (미래 크랙 비율, 0~1) : 0.0357
+
+[STEP 6/7] 미래(future) 위험도 분석
+
+=== [future] d.png ===
+w_max_mm        : 1.9181
+rho_L_per_m     : 1.4077
+length_m        : 0.0717
+D_f             : 1.4108
+area_mm2        : 61.7975
+--- Severity scores (0~1) ---
+S_w             : 1.000
+S_density       : 0.682
+S_area          : 0.062
+S_fractal       : 0.527
+S_length        : 0.119
+S_total         : 0.478
+--- Probability components (0~1) ---
+P_TipSharpness  : 0.267
+P_WidthGradient : 0.506
+P_Orientation   : 0.035  (angle=171.4°, base=0.296)
+P               : 0.270
+--- Risk (0~1) ---
+R               : 0.405, Level: C
+
+[STEP 7/7] 현재 vs 미래 위험도 요약
+
+===== SUMMARY =====
+Image: d.png
+mm_per_pixel: 0.05
+---- NOW ----
+S_now = 0.441
+P_now = 0.283
+R_now = 0.386, Level=B
+---- FUTURE ----
+S_future = 0.478
+P_future = 0.270
+R_future = 0.405, Level=C
+---- Δ(변화량) ----
+ΔS = +0.036
+ΔR = +0.019
+
+[STEP 7/7] 전체 파이프라인 완료
+```
+
 # LICENSE
 
 BSD 2-Clause License
