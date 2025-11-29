@@ -1,502 +1,399 @@
 # UNet-Base Crack Future Risk Analysis Pipeline
 
+_(YOLOv8 Segmentation + Vizuara UNet + Future-mask UNet All-in-one)_
+
 <div align="left">
-스마트 건물 안전 관리를 위해 Vision & AI 기술을 활용한 콘크리트 크랙 탐지에 관한 연구
+스마트 건물 안전 관리를 위해 Vision &amp; AI 기술을 활용한 콘크리트 크랙 탐지 및 미래 위험도 예측 파이프라인
 </div>
 
 **Affiliation**
+
 - 최시훈 (CHOI SIHUN)
 - Department of Smart Convergence Engineering, Hanyang Univ. ERICA
 
 **Contact**
+
 - 📧 fkdldkrhya@hanyang.ac.kr
 
 **Research Interests**
-- AI
-- Computer Vision
+
+- AI / Computer Vision / Structural Health Monitoring
 
 ---
 
-(now + future U-Net, CrackSeq 기반)
+## 0. 전체 파이프라인 개요
 
-콘크리트 크랙 이미지를 입력으로 받아서:
+이 리포지토리는 **단일 스크립트** `risklevel_prediction.py` 안에서  
+다음 과정을 **end-to-end**로 수행하는 파이프라인을 구현합니다.
 
-1. **현재(now) 크랙 마스크**를 만들고
-2. 현재 크랙에 대한 **Severity(S)**, **Probability(P)**, **Risk(R)**를 계산한 뒤
-3. CrackSeq GT 마스크로 학습된 **Future-mask U-Net**으로  
-   **미래(future) 크랙 마스크**를 예측하고
-4. 동일한 방식으로 미래 크랙의 S, P, R을 계산
-5. 마지막으로 **현재 vs 미래 위험도 변화를 비교 (ΔS, ΔR)**
+1. 입력 콘크리트 이미지에서 **YOLOv8 세그멘테이션**으로 크랙 후보 **ROI 마스크** 생성
+2. 전체 이미지를 **Vizuara UNet**에 넣어 **크랙 확률맵(UNet_Prob)** 생성
+3. YOLO ROI 정보를 이용해 **확률맵을 boost** 하는 가중치 앙상블
 
-까지 수행하는 전체 파이프라인입니다.
+   \[
+   \text{Final_Prob} = \mathrm{clip}(\text{UNet_Prob} + \alpha \cdot \text{YOLO_Mask}, 0, 1)
+   \]
 
-구성 파일:
+   - `YOLO_BOOST_ALPHA = α` (기본 0.30)
 
-- 학습 스크립트: `future_unet_train.py.py`
-- 추론/위험도 평가 스크립트: `risklevel_prediction.py`
+4. **Final_Prob + 에지(edge) 특징**을 사용해 **GMM 클러스터링**으로 이진화 → **base now 마스크**
+5. 너무 작은 blob / 원형에 가까운 blob / aspect가 작은 잡음을 제거 → **최종 now 마스크**
+6. 최종 now 마스크를 **future-mask UNet**에 넣어, 타일링 기반으로 **미래 크랙 마스크** 예측
+7. now / future 마스크 각각에 대해:
+
+   - **글로벌 위험도 분석** (Severity S, Probability P, Risk R, Level A~D)
+   - **컴포넌트별(가지별) 위험도 분석** 및 bounding box 시각화
+
+8. 마지막으로 **현재 vs 미래 위험도 변화** (ΔS, ΔR)를 계산하고 콘솔에 요약 출력
 
 ---
 
-## 1. 설치 및 요구 사항
+## 1. 파일 구성
 
-### 1.1 Python 및 라이브러리
+현재 버전의 핵심은 다음 한 파일입니다.
 
-- Python 3.8+
-- PyTorch
-- NumPy
-- OpenCV (`opencv-python`)
-- scikit-learn (GaussianMixture)
-- Pillow
-- torchvision
-- huggingface_hub
+- `risklevel_prediction.py`
+  - YOLOv8 ROI 세그멘테이션
+  - Vizuara UNet 확률맵 + YOLO boost + GMM 이진화
+  - 원형/잡음 제거 및 컴포넌트 분리
+  - future-mask UNet 타일링 추론
+  - now/future 글로벌 & 컴포넌트별 위험도 분석
+  - 결과 이미지 저장 & 콘솔 요약 출력
+
+추가로 필요한 모델 가중치:
+
+- `future_mask_unet_h4_v2.pth`
+  - CrackSeq 기반 **미래 크랙 마스크** 예측용 U-Net 가중치
+  - 로딩 위치는 스크립트 상단의 `FUTURE_MODEL_PATH` 설정을 따릅니다.
+
+> **참고**: 미래 U-Net 학습 스크립트(`future_unet_train.py.py`)는 별도 파일로 존재하며,  
+> CrackSeq multi-temporal GT 마스크를 이용해 `future_mask_unet_h4_v2.pth`를 학습합니다.  
+> (이 README에서는 **추론 파이프라인** 위주로 설명합니다.)
+
+---
+
+## 2. 설치 및 요구 사항
+
+### 2.1 Python 버전
+
+- Python **3.8+** 권장
+
+### 2.2 필수 의존성
 
 ```bash
 pip install torch torchvision torchaudio
-pip install numpy opencv-python scikit-learn pillow huggingface_hub
+
+pip install   numpy   opencv-python   scikit-learn   pillow   huggingface_hub   ultralytics
 ```
 
----
-
-## 2. 데이터 및 디렉토리 구조
-
-### 2.1 학습용 데이터 구조 (`future_unet_train.py.py`)
-
-```text
-data_root/
-  ├─ images/           # (현재 버전에서는 사용하지 않아도 되지만, 확장 가능)
-  └─ targets/
-       ├─ multi_target_0001.npy
-       ├─ multi_target_0002.npy
-       └─ ...
-```
-
-- `targets/multi_target_*.npy` 만 사용
-- 각 `multi_target_XXXX.npy`:
-  - shape: `(T, H, W)` 또는 `(T, H, W, 1)` (또는 방어적으로 `(T, H, W, 3)`이면 첫 채널 사용)
-  - `T`: multi-temporal 시점 수
-  - `vol[t]` = 시점 `t`의 GT 크랙 마스크
-
-### 2.2 마스크 전처리 규칙 (공통)
-
-모든 마스크는 다음 규칙을 따릅니다.
-
-1. `float32`로 변환
-2. max 값이 1보다 크면 `0~255`라고 가정하고 `/255.0` 으로 정규화
-3. `binarize_threshold` (기본 0.5) 이상이면 1, 미만이면 0으로 이진화
-4. 최종 마스크는 **0.0 또는 1.0 값만 가지는 이진 마스크**
-
-이 규칙은:
-
-- 학습용 GT (`FutureMaskDataset`)
-- 현재/미래 위험도 분석 (`analyze_mask`)
-- 타일링 예측 (`predict_future_mask_tiled`)
-
-에서 일관되게 적용됩니다.
-
----
-
-## 3. Future-mask U-Net 학습 (`future_unet_train.py.py`)
-
-### 3.1 목적
-
-- CrackSeq GT 마스크만 사용해서:
-
-  - 입력: 현재 마스크 `mask_t`
-  - 출력: Δ 스텝 이후 마스크 `mask_{t+Δ}`
-
-  를 예측하는 **2D U-Net**을 학습합니다.
-
-- 원본 intensity 이미지는 사용하지 않고, **마스크→마스크 순수 변환**에 집중합니다.
-- 크랙 픽셀 비율이 매우 낮은 불균형 데이터 상황을 고려하여:
-  - **너무 쉬운 샘플 제거 (future mask foreground 비율이 너무 낮은 경우)**
-  - **foreground 비율 기반 `pos_weight` 자동 추천**
-  - **Dice 비중을 높인 BCE+Dice 복합 손실 사용**
-
-### 3.2 FutureMaskDataset (mask_now, mask_future 쌍 생성)
-
-클래스: `FutureMaskDataset`
-
-- 입력: `data_root`, `horizon_steps`, `min_fg_ratio`, `binarize_threshold`
-- 주요 로직:
-
-1. `targets/multi_target_*.npy` 전체 스캔
-2. 각 파일에 대해:
-
-   - `vol` shape: `(T, H, W)` 형태로 정규화
-   - 시간축 `t = 0 .. T-1` 순회
-   - `t_future = t + horizon_steps`
-   - `t_future < T` 인 경우만 후보
-
-3. `mask_future = vol[t_future]` 를 전처리 후 foreground 비율(`fg_ratio`) 계산
-4. `fg_ratio < min_fg_ratio`(기본 0.0005 = 0.05%)이면 **해당 쌍 제외**
-   - 거의 올 배경인 trivial sample 제거
-5. 조건을 통과한 `(path, t_now, t_future)` 쌍만 `self.index_tuples`에 저장
-6. 동시에 전체 future 마스크에 대해 `total_foreground`, `total_pixels`를 누적하여  
-   전역 `fg_ratio` 계산
-
-#### pos_weight 자동 추정
-
-Dataset 생성 시:
-
-```text
-fg_ratio = total_foreground / total_pixels
-pos_weight ≈ (1 - fg_ratio) / fg_ratio
-```
-
-이 값은 `BCEWithLogitsLoss(pos_weight=...)`에 사용될 **권장값**입니다.
-
-- `--pos_weight_override` 가 `None`이면 Dataset에서 계산한 값 사용
-- 직접 수동으로 지정하고 싶으면 `--pos_weight_override` 인자로 덮어쓰기
-
-### 3.3 U-Net2D 구조 (학습용)
-
-`UNet2D` (학습용) 요약:
-
-- 입력: `(B, 1, H, W)` (현재 마스크)
-- 출력: `(B, 1, H, W)` (Δ 이후 미래 마스크 logits)
-- 인코더:
-  - `DoubleConv(1→64)`
-  - `Down(64→128)`
-  - `Down(128→256)`
-  - `Down(256→512)`
-  - `Down(512→1024//factor)`
-- 디코더:
-  - `Up(1024→512//factor)`
-  - `Up(512→256//factor)`
-  - `Up(256→128//factor)`
-  - `Up(128→64)`
-- 마지막: `OutConv(64→1)`로 채널 1개 출력 (logits)
-
-Upsample은 bilinear + conv 구조를 사용합니다.
-
-### 3.4 Loss 구성 (BCE + Dice)
-
-- `BCEWithLogitsLoss(pos_weight)`
-- `DiceLoss` (logits → sigmoid 후 Dice)
-
-최종 손실:
-
-```text
-loss = 0.2 * BCEWithLogitsLoss + 0.8 * DiceLoss
-```
-
-의도:
-
-- BCE: 픽셀 단위 분류 안정화
-- Dice: 희소한 크랙 마스크의 전체 overlap을 잘 맞춤
-
-### 3.5 학습 루프 요약
-
-1. Train:
-   - `model.train()`
-   - 각 배치에 대해 forward → loss → backward → `optimizer.step()`
-2. Validation:
-   - `model.eval()` + `torch.no_grad()`
-   - 같은 loss 조합으로 평균 val_loss 계산
-3. Best 모델 저장:
-   - `avg_val_loss`가 최소일 때마다 `save_path`에 `state_dict` 저장
-
-### 3.6 실행 예시 및 인자
+선택(있으면 더 좋음):
 
 ```bash
-python future_unet_train.py.py \
-  --data_root ./crackseq_dataset_multi_mono_patches/data/multi-temporal \
-  --horizon_steps 4 \
-  --epochs 50 \
-  --batch_size 8 \
-  --lr 1e-4 \
-  --save_path future_mask_unet_h4_v2.pth
+# skeletonize를 위해 ximgproc thinning을 쓰고 싶다면
+pip install opencv-contrib-python
 ```
 
-주요 인자:
-
-- `--data_root`: `images/`, `targets/`가 포함된 루트 경로
-- `--horizon_steps`: Δ (t_now → t+Δ)
-- `--epochs`: epoch 수
-- `--batch_size`: 배치 크기
-- `--lr`: learning rate
-- `--val_ratio`: train/val 비율 (기본 0.2)
-- `--min_fg_ratio`: future mask foreground 비율 하한
-- `--device`: `"auto"`, `"cuda"`, `"cpu"`, `"mps"` 등
-- `--save_path`: best 모델 가중치 저장 경로
-- `--seed`: random seed
-- `--pos_weight_override`: pos_weight 수동 지정 시 사용
+> `opencv-contrib-python`이 없더라도, 스크립트 내부에서 **fallback skeletonization** 로직을 사용하므로 동작은 가능합니다.
 
 ---
 
-## 4. Future-mask UNet (추론용, `risklevel_prediction.py`)
+## 3. 사용 모델 & 체크포인트
 
-`risklevel_prediction.py` 안의 `FutureMaskUNet`은 학습용 `UNet2D`와 채널 구성이 맞도록 정의되어 있습니다.
+### 3.1 Vizuara UNet (현재 마스크용)
 
-- 입력: `(B, 1, H, W)` (현재 now_mask 패치)
-- 출력: `(B, 1, H, W)` (미래 mask logits)
+- Hugging Face Hub: `Vizuara/unet-crack-segmentation`
+- 가중치 파일명: `unet_weights_v2.pth`
+- 스크립트 내에서 `hf_hub_download`로 **자동 다운로드**됩니다.
 
-구성 요약:
+역할:
 
-- 인코더:
-  - `inc = DoubleConv(1, 64)`
-  - `down1 = Down(64, 128)`
-  - `down2 = Down(128, 256)`
-  - `down3 = Down(256, 512)`
-  - `down4 = Down(512, 512)` (bottleneck)
-- 디코더:
-  - `up1 = Up(512+512 → 256)`
-  - `up2 = Up(256+256 → 128)`
-  - `up3 = Up(128+128 → 64)`
-  - `up4 = Up(64+64 → 64)`
-- 출력: `outc = OutConv(64, 1)`
+- 크랙 edge에 특화된 전처리(`crack_edge_boost`)를 거친 이미지를 입력으로 받아,
+- 픽셀 단위 크랙 확률맵 `prob_map_unet (H, W, 0~1)` 생성
 
-`load_future_unet(model_path, device)`로 가중치를 로드합니다.
+### 3.2 YOLOv8 Segmentation (ROI 마스크용)
+
+- Hugging Face Hub: `OpenSistemas/YOLOv8-crack-seg`
+- 기본 가중치 경로: `"yolov8x/weights/best.pt"`
+- 스크립트 내부:
+
+  ```python
+  YOLO_REPO_ID = "OpenSistemas/YOLOv8-crack-seg"
+  YOLO_WEIGHT_FILENAME = "yolov8x/weights/best.pt"
+  ```
+
+역할:
+
+- 입력 이미지를 YOLOv8 세그멘테이션 모델에 통과시켜,
+- 검출된 모든 마스크를 OR한 결과를 **ROI 마스크(0/1)**로 사용
+- 이 ROI가 Vizuara UNet 확률맵을 **boost**하는 데 사용됨
+
+### 3.3 Future-mask U-Net (미래 마스크 예측용)
+
+- 로컬 파일: `future_mask_unet_h4_v2.pth`
+- 네트워크 구조: 스크립트 내 `FutureMaskUNet`
+  - 입력: `(1, 1, H, W)` 형태의 **now 마스크 patch**
+  - 출력: `(1, 1, H, W)` 형태의 **미래 마스크 logits**
+
+역할:
+
+- 현재(now) 마스크를 타일 단위로 입력받아,
+- CrackSeq multi-temporal GT를 통해 학습된 미래 크랙 분포를 예측
 
 ---
 
-## 5. 현재(now) 마스크 생성 (`risklevel_prediction.py`)
+## 4. 파이프라인 상세 설명
 
-### 5.1 Otsu 기반 모드
+### 4.1 YOLOv8 ROI 마스크 생성
 
-```bash
---now_mask_mode otsu
-```
+함수: `generate_yolo_roi_mask_seg(image_path, yolo_model)`
 
-로 설정할 때 사용됩니다.
+- YOLOv8 segmentation으로 inference 수행
+- 결과 마스크들을 모두 OR하여 단일 ROI 마스크 생성
+- ROI 마스크를 원본 해상도로 리사이즈 (`(H, W)` 0/1)
+- 저장 파일:
+  - `<base>_yolo_roi_mask.png`
+  - `<base>_yolo_roi_overlay.png` (원본 위에 ROI 영역을 녹색으로 표시)
 
-- `load_crack_mask_from_image(image_path, invert, blur_ksize)`:
-  - BGR → Gray 변환
-  - 선택적으로 GaussianBlur
-  - Otsu 이진화 (`THRESH_BINARY` 또는 `THRESH_BINARY_INV`)
-- 결과:
-  - `now_mask`: `(H, W)` 0/1 마스크 (uint8)
-- 디버그 출력:
-  - `out/<basename>_gray.png`
-  - `out/<basename>_thresh.png`
+### 4.2 Vizuara UNet 확률맵 + YOLO boost + GMM 이진화
 
-### 5.2 Vizuara UNet + GMM 기반 모드
-
-```bash
---now_mask_mode unet
-```
-
-로 설정할 때 사용됩니다.
-
-#### 5.2.1 VizuaraUNet
-
-- HuggingFace Hub:
-  - repo: `Vizuara/unet-crack-segmentation`
-  - weights: `unet_weights.pth`
-- 3채널 입력(256x256), 1채널 출력(sigmoid) 구조
-
-#### 5.2.2 Edge boost 전처리
+#### 4.2.1 Edge-boosted 입력 생성
 
 함수: `crack_edge_boost(image_bgr)`
 
-- Gray 변환
-- CLAHE로 대비 향상
-- Sobel(3,5) 및 Laplacian 결합
-- edge + intensity 정보를 강화한 gray 이미지를 RGB로 변환해 UNet에 입력
+- Gray 변환 → CLAHE로 대비 향상
+- Sobel + Laplacian 결합으로 edge 강화
+- edge + intensity를 혼합한 gray 이미지를 RGB로 변환하여 UNet 입력으로 사용
 
-#### 5.2.3 UNet 확률맵 생성
+#### 4.2.2 UNet 확률맵 생성
 
 함수: `run_unet_prob_map(model, image_bgr, device)`
 
-- boosted 이미지를 256x256으로 resize
-- UNet forward → sigmoid → 확률맵
-- 원본 해상도로 bilinear resize → `prob_map` (0~1 float)
+- 256×256으로 resize → Vizuara UNet 추론 → sigmoid
+- 원본 해상도로 bilinear resize하여 `prob_map_unet (H, W, 0~1)` 생성
 
-#### 5.2.4 GMM 기반 이진화
-
-함수: `prob_to_binary_gmm(prob_map, image_bgr, n_components, save_debug)`
-
-- `prob_map`을 [0,1]로 정규화
-- Gray에서 Sobel로 edge magnitude 계산 후 [0,1]로 정규화
-- 각 픽셀의 feature = `[prob_norm, edge_norm]`
-- `GaussianMixture(n_components=3)`로 학습 후 전체 픽셀에 대해 클러스터 예측
-- 각 클러스터에 대해 평균 prob_norm 계산 →
-  - 가장 큰 평균값을 갖는 클러스터를 main crack cluster로 선택
-  - 필요 시 두 번째 cluster까지 포함
-- 후처리:
-  - Morphological open/erode
-  - `keep_elongated_components`: 세장비/면적 기준으로 가늘고 긴 컴포넌트만 유지
-  - `fill_small_holes_by_contours`: 작은 홀 영역 채우기
-- 결과:
-  - `0/1` now_mask (uint8)
-
-#### 5.2.5 마스크 및 오버레이 저장
+#### 4.2.3 YOLO boost 기반 앙상블
 
 함수: `generate_crack_mask_unet_gmm(...)`
 
-- `out/<basename>_now_unet_mask.png`
-- `out/<basename>_now_unet_overlay.png` (원본 위에 붉은 크랙 영역)
+- YOLO ROI가 있다면:
 
----
+  ```python
+  prob_map_final = prob_map_unet + YOLO_BOOST_ALPHA * YOLO_Mask
+  prob_map_final = np.clip(prob_map_final, 0.0, 1.0)
+  ```
 
-## 6. 타일링 기반 미래 마스크 예측
+- `YOLO_BOOST_ALPHA`를 조절하여:
+  - YOLO에 더 의존 (↑): ROI 안에서 확률이 강하게 상승
+  - UNet에 더 의존 (↓): 전역 세그멘테이션에 더 의존
+
+디버그 출력:
+
+- `<base>_unet_prob_raw.png`
+- `<base>_unet_prob_boosted.png`
+
+#### 4.2.4 GMM 이진화 + 길게 뻗은 컴포넌트 유지
+
+함수: `prob_to_binary_gmm(prob_map_final, image_bgr, n_components)`
+
+- 특징 벡터: `[Final_Prob_norm, Edge_norm]`
+- `GaussianMixture(n_components=3)`로 클러스터링
+- 평균 확률이 높은 클러스터를 크랙 클러스터로 선택 (필요 시 2개까지)
+- Morphological open / erode로 가벼운 잡음 제거
+- `keep_elongated_components`:
+  - 세장비(aspect ratio), 정상화 길이(norm_len), 최소 면적 기준으로  
+    **가늘고 긴 컴포넌트**만 유지
+- `fill_small_holes_by_contours`:
+  - 전체 이미지 대비 작은 비율의 홀만 채워 내부를 메움
+
+최종 결과:
+
+- `unet_now_mask (H, W, 0/1)`
+
+저장:
+
+- `<base>_now_base_mask.png`
+- `<base>_now_base_overlay.png`
+
+### 4.3 원형/잡음 제거 → 최종 now 마스크
+
+함수: `filter_crack_like_components(combined_mask, image_path)`
+
+- 각 connected component에 대해:
+  - 면적(area) < `MIN_COMP_AREA` → 제거
+  - 긴 변(long_axis) < `MIN_LONG_AXIS` & aspect < `MIN_ASPECT_RATIO` → 제거
+  - **원형성(circularity)**:
+    - \(\mathcal{C} = 4\pi A / P^2\)
+    - \(\mathcal{C} > \text{MAX_CIRCULARITY}\) & aspect < `MIN_ASPECT_RATIO` → 제거
+- 나머지를 모두 합쳐 최종 now 마스크 생성
+
+저장:
+
+- `<base>_now_mask_raw.png`
+- `<base>_now_mask_filtered.png`
+- `<base>_now_final_overlay.png` (원본 위에 최종 now 마스크 표시)
+
+### 4.4 타일링 기반 미래 마스크 예측
 
 함수: `predict_future_mask_tiled(model, now_mask, device, pred_thresh, tile, stride)`
 
-- 입력:
-  - `now_mask`: `(H, W)` 0/1
-  - `tile`: 타일 크기 (기본 128)
-  - `stride`: 슬라이딩 간격 (기본 64, overlap 존재)
-- 절차:
+- now 마스크를 `tile × tile` 크기 패치로 슬라이딩 (stride 간격)
+- 패치가 작으면 zero padding
+- 각 패치를 `[0,1]`로 정규화 후 Future U-Net에 통과
+- 확률맵을 원위치에 accumulate 후 `weight`로 정규화
+- 최종:
 
-  1. `now_mask`를 0/255 uint8로 변환
-  2. `y = 0..H, x = 0..W`에 대해 stride 간격으로 타일을 잘라냄
-  3. 타일 크기가 작으면 zero padding으로 (tile, tile)까지 확장
-  4. 0~1 float로 정규화 후 `(1,1,tile,tile)` 텐서로 모델에 입력
-  5. sigmoid(logits)로 얻은 확률맵에서 ph,pw 범위만 잘라 원위치에 더함
-  6. 동일 위치에 여러 타일이 겹친 경우 `weight`를 누적해서  
-     마지막에 `prob_full /= weight`로 평균
+  - `future_prob (H, W, 0~1)`
+  - `future_bin = (future_prob >= pred_thresh)`
 
-- 결과:
+저장:
 
-  - `future_prob`: 전체 이미지 크기의 0~1 확률맵
-  - `future_bin`: `future_prob >= pred_thresh` 이면 1, 아니면 0
-  - `mean_prob`: 확률맵의 전체 평균
-  - `fg_ratio`: 미래 바이너리 마스크에서 foreground 비율
+- `<base>_future_prob.png`
+- `<base>_future_mask.png`
+- `<base>_future_final_overlay.png`
 
-- 저장:
-  - `out/<basename>_future_prob.png`
-  - `out/<basename>_future_mask.png`
+콘솔:
 
----
+- `mean_prob`: 전체 평균 예측 확률
+- `fg_ratio`: 미래 마스크 foreground 비율
 
-## 7. 위험도 분석 (`analyze_mask`)
+### 4.5 글로벌 & 컴포넌트별 위험도 분석
 
-현재(now)와 미래(future) 모두 같은 함수를 사용합니다.
+공통 함수: `analyze_mask(image_path, crack_mask, mm_per_pixel, tag)`
 
-### 7.1 Severity Features
+#### 4.5.1 Severity (S, 0~1)
 
 `SeverityFeatures`:
 
 - `w_max_mm` : 최대 크랙 폭 (mm)
-- `rho_L_per_m` : 단위 폭당 크랙 길이 (1/m, 밀도)
+- `rho_L_per_m` : 단위 폭당 크랙 길이 (선형 밀도, 1/m)
 - `area_mm2` : 크랙 면적 (mm²)
 - `D_f` : 프랙탈 차원
 - `length_m` : 총 크랙 길이 (m)
 
-각 물리량은:
+각 feature는 아래 임계값을 기준으로 0~1로 정규화됩니다.
 
-- distance transform, skeletonization, box-counting 등으로 계산됩니다.
+- 폭: `WIDTH_T0_MM`, `WIDTH_T1_MM`
+- 밀도: `DENSITY_T0_PER_M`, `DENSITY_T1_PER_M`
+- 면적: `AREA_T0_MM2`, `AREA_T1_MM2`
+- 프랙탈: `FRACTAL_LOW`, `FRACTAL_HIGH`
+- 길이: `LENGTH_T0_M`, `LENGTH_T1_M`
 
-### 7.2 Severity Score (0~1)
+`SeverityScores`:
 
-함수: `compute_severity(feats, weights)`
+- `S_w`, `S_density`, `S_area`, `S_fractal`, `S_length`
+- 가중 평균:
 
-각 feature를 piecewise 함수로 0~1로 정규화:
+  \[
+  S*\text{total} = \frac{\alpha S_w + \beta S*{density} + \gamma S*{area} + \delta S*{fractal} + \epsilon S\_{length}}{\alpha+\beta+\gamma+\delta+\epsilon}
+  \]
 
-- `S_w` : 폭 기준 (`WIDTH_T0_MM`, `WIDTH_T1_MM`)
-- `S_density` : 밀도 기준 (`DENSITY_T0_PER_M`, `DENSITY_T1_PER_M`)
-- `S_area` : 면적 기준 (`AREA_T0_MM2`, `AREA_T1_MM2`)
-- `S_fractal` : 프랙탈 기준 (`FRACTAL_LOW`, `FRACTAL_HIGH`)
-- `S_length` : 길이 기준 (`LENGTH_T0_M`, `LENGTH_T1_M`)
-
-가중 평균:
-
-```text
-S_total = (α*S_w + β*S_density + γ*S_area + δ*S_fractal + ε*S_length) / (α+β+γ+δ+ε)
-```
-
-기본적으로 α~ε는 모두 1.0입니다.
-
-### 7.3 Probability 구성요소
+#### 4.5.2 Probability (P, 0~1)
 
 `ProbabilityInputs`:
 
-- `P_TipSharpness` : tip sharpness 점수 (0~1)
-- `P_WidthGradient` : 폭 변화 gradient 점수 (0~1)
-- `P_Orientation` : orientation 기반 점수 (0~1)
+- `P_TipSharpness` : tip sharpness 기반 (끝단이 얼마나 뾰족한지)
+- `P_WidthGradient` : skeleton 상 폭 변화(gradient) 기반
+- `P_Orientation` : 크랙 방향(angle) 및 길이에 따른 위험도
 
-1. **Tip sharpness**:
-   - skeleton endpoint 주변과 내부 폭을 비교하여 얼마나 뾰족한지 평가
-2. **Width gradient**:
-   - skeleton 상의 폭 분포에서 10 percentile vs 90 percentile을 사용해  
-     상대적인 폭 변화량을 정규화
-3. **Orientation**:
-   - skeleton 좌표에 PCA 적용 → 주 방향 벡터, 각도(angle_deg)
-   - 각도로부터 orientation risk base (sin(2θ) 형태) 계산
-   - 여기에 `S_length`를 곱해 `P_Orientation` 구성
+계산 방식:
 
-최종 Probability:
+1. skeleton endpoint 주변/내부 폭을 비교하여 tip이 가늘수록 점수 ↑
+2. skeleton 폭 분포의 10/90 percentile 차이를 통해 폭 변화량 정규화
+3. PCA 기반 주 방향을 구해 angle → orientation risk base (sin(2θ) 형태)  
+   여기에 `S_length`를 곱해 `P_Orientation` 구성
 
-```text
-P = (α*P_TipSharpness + β*P_WidthGradient + γ*P_Orientation) / (α+β+γ)
-```
+최종:
 
-기본적으로 α=β=γ=1.0입니다.
+\[
+P = \frac{\alpha P*{Tip} + \beta P*{Grad} + \gamma P\_{Orient}}{\alpha+\beta+\gamma}
+\]
 
-### 7.4 Risk 계산 및 Level 분류
+기본적으로 α=β=γ=1입니다.
 
-함수: `compute_risk(img_path, S, P, risk_weights, mode, normalize_weights)`
+#### 4.5.3 Risk (R, 0~1) 및 Level (A~D)
 
-두 가지 모드:
+함수: `compute_risk(img_path, S, P, mode="weighted_sum")`
 
-1. `mode="product"`:
-   ```text
-   R = S * P
-   ```
-2. `mode="weighted_sum"` (기본):
-   ```text
-   R = wS * S + wP * P   (wS + wP = 1)
-   ```
+- `mode="product"`: \(R = S \cdot P\)
+- `mode="weighted_sum"` (기본):
 
-S, P, R은 모두 0~1 범위로 클램프합니다.
+  \[
+  R = w_S S + w_P P,\quad w_S + w_P = 1
+  \]
 
 Risk Level 분류:
 
-- R < 0.2 → A
-- R < 0.4 → B
-- R < 0.7 → C
-- 그 이상 → D
+- `R < 0.2` → Level A
+- `0.2 ≤ R < 0.4` → Level B
+- `0.4 ≤ R < 0.7` → Level C
+- `0.7 ≤ R` → Level D
 
-최종 결과는 `RiskResult`에 담겨 반환되며, 콘솔에는 상세 로그를 출력합니다.
+#### 4.5.4 컴포넌트별 분석 & BBox 시각화
 
-또한, `analyze_mask` 실행 시:
+함수: `analyze_components(image_path, mask, mm_per_pixel, tag_prefix)`
 
-- 마스크: `<basename>_<tag>_mask.png`
-- 컬러맵: `<basename>_<tag>_mask_color.png`
-- skeleton: `<basename>_<tag>_skeleton.png`
-- skeleton + 주 방향: `<basename>_<tag>_skeleton_orient.png`
-
-등이 `out/`에 저장됩니다.
+- connected component를 하나의 크랙 가지로 보고 각 가지에 대해 `analyze_mask` 수행
+- 각 컴포넌트에 대해:
+  - 개별 마스크 & skeleton & orientation 이미지
+  - 원본 위에 해당 컴포넌트만 붉게 표시 + bounding box(초록색) 표시
+  - 파일명 예: `<base>_now_comp_c3_bbox.png`
+- 전체 컴포넌트 bbox를 한 장에 모은 이미지도 생성:
+  - `<base>_now_comp_components_bbox_all.png`
+  - `<base>_future_comp_components_bbox_all.png`
 
 ---
 
-## 8. 메인 파이프라인 (`risklevel_prediction.py`)
+## 5. 메인 실행 방법
 
-메인 함수 흐름:
+### 5.1 스크립트 내 하드코딩 파라미터
 
-1. 인자 파싱
-   - `image_path`
-   - `mm_per_pixel`
-   - `model_path` (future-mask U-Net 가중치)
-   - `pred_thresh`, `tile`, `stride`
-   - `now_mask_mode` ("otsu" 또는 "unet")
-   - `gmm_components`, `save_debug`
-2. 디바이스 선택 (`cuda` / `mps` / `cpu`)
-3. 현재(now) 크랙 마스크 생성
-   - `now_mask_mode=="otsu"` → Otsu
-   - `now_mask_mode=="unet"` → Vizuara UNet + GMM
-4. `analyze_mask(..., tag="now")`로 현재 위험도 분석
-5. `load_future_unet(model_path, device)`로 future-mask U-Net 로딩
-6. `predict_future_mask_tiled(...)`로 미래 확률맵/마스크 예측
-7. `analyze_mask(..., tag="future")`로 미래 위험도 분석
-8. 콘솔에 요약 출력:
+`run_pipeline()` 상단에서 다음을 수정합니다.
+
+```python
+def run_pipeline():
+    # ======== 여기를 너 환경에 맞게 수정 =========
+    IMAGE_PATH = "a.png"                    # 분석할 이미지 경로
+    MM_PER_PIXEL = DEFAULT_MM_PER_PIXEL     # 이미지 스케일 (mm/px)
+    FUTURE_MODEL_PATH = "future_mask_unet_h4_v2.pth"  # 미래 UNet 가중치 경로
+    # ======================================
+```
+
+- `IMAGE_PATH` : 분석할 콘크리트 이미지 파일
+- `MM_PER_PIXEL` : 픽셀당 mm (없으면 1.0으로 두고 상대 비교용으로 사용)
+- `FUTURE_MODEL_PATH` : future-mask U-Net 가중치 파일 위치
+
+### 5.2 실행
+
+```bash
+python risklevel_prediction.py
+```
+
+### 5.3 출력 결과
+
+- 모든 결과 이미지는 **`out/` 폴더**에 저장됩니다.
+- 콘솔에는 다음과 같은 요약이 출력됩니다.
 
 ```text
-===== SUMMARY =====
-Image: <image_path>
-mm_per_pixel: <val>
----- NOW ----
+===== SUMMARY (GLOBAL) =====
+Image         : a.png
+mm_per_pixel  : 0.10
+---- NOW GLOBAL ----
 S_now = ...
 P_now = ...
 R_now = ..., Level=...
----- FUTURE ----
+---- FUTURE GLOBAL ----
 S_future = ...
 P_future = ...
 R_future = ..., Level=...
 ---- Δ(변화량) ----
 ΔS = ...
 ΔR = ...
+
+===== SUMMARY (COMPONENT COUNT) =====
+now_components    : N_now
+future_components : N_future
+
+[INFO] 모든 결과 이미지는 out/ 폴더에 저장됨.
 ```
 
 ---
@@ -557,103 +454,6 @@ python risklevel_prediction.py G.png \
 
 이 README는 `future_unet_train.py.py`와 `risklevel_prediction.py`의 전체 동작을  
 한 번에 이해하고 재현할 수 있도록 정리한 문서입니다.
-
-## 11. 예시 출력
-```
-[INFO] Using device: mps
-
-[STEP 1/7] 입력 이미지 존재 여부 확인
-
-[STEP 2/7] 현재(now) 크랙 마스크 생성 (Vizuara UNet + GMM)
-[INFO] Loading Vizuara UNet weights from HF: Vizuara/unet-crack-segmentation/unet_weights.pth
-[INFO] UNet weights downloaded at: /Users/user/.cache/huggingface/hub/models--Vizuara--unet-crack-segmentation/snapshots/ceb5d57f750c5135edf5532fc3656d2070737cd5/unet_weights.pth
-[INFO] Image shape: 1018x680 (WxH)
-[INFO] Running Vizuara UNet inference...
-[INFO] Running GMM clustering on [prob, edge] features...
-[INFO] prob_map min=0.0000, max=0.3385
-[INFO] Fitting GMM (n_components=3) on 50000 samples...
-[INFO] cluster 0: mean_norm=0.0001, count=58580
-[INFO] cluster 1: mean_norm=0.0000, count=612238
-[INFO] cluster 2: mean_norm=0.2971, count=21422
-[INFO] Main crack cluster = 2 (mean_norm=0.2971)
-[INFO] crack_clusters = [2]
-[INFO] Saved crack mask to: out/d_now_unet_mask.png
-[INFO] Saved overlay to: out/d_now_unet_overlay.png
-
-[STEP 3/7] 현재(now) 위험도 분석
-
-=== [now] d.png ===
-w_max_mm        : 1.5788
-rho_L_per_m     : 1.4381
-length_m        : 0.0732
-D_f             : 1.3413
-area_mm2        : 44.2825
---- Severity scores (0~1) ---
-S_w             : 1.000
-S_density       : 0.688
-S_area          : 0.044
-S_fractal       : 0.353
-S_length        : 0.122
-S_total         : 0.441
---- Probability components (0~1) ---
-P_TipSharpness  : 0.285
-P_WidthGradient : 0.528
-P_Orientation   : 0.035  (angle=171.6°, base=0.289)
-P               : 0.283
---- Risk (0~1) ---
-R               : 0.386, Level: B
-
-[STEP 4/7] 미래 크랙 마스크 예측 UNet 로딩
-[INFO] Loaded future-mask UNet weights from: future_mask_unet_h4_v2.pth
-
-[STEP 5/7] 미래 마스크(probability map) 예측 (타일링)
-
-[INFO] 미래 예측 요약
-  - mean_prob (평균 예측 확률)     : 0.0884
-  - fg_ratio (미래 크랙 비율, 0~1) : 0.0357
-
-[STEP 6/7] 미래(future) 위험도 분석
-
-=== [future] d.png ===
-w_max_mm        : 1.9181
-rho_L_per_m     : 1.4077
-length_m        : 0.0717
-D_f             : 1.4108
-area_mm2        : 61.7975
---- Severity scores (0~1) ---
-S_w             : 1.000
-S_density       : 0.682
-S_area          : 0.062
-S_fractal       : 0.527
-S_length        : 0.119
-S_total         : 0.478
---- Probability components (0~1) ---
-P_TipSharpness  : 0.267
-P_WidthGradient : 0.506
-P_Orientation   : 0.035  (angle=171.4°, base=0.296)
-P               : 0.270
---- Risk (0~1) ---
-R               : 0.405, Level: C
-
-[STEP 7/7] 현재 vs 미래 위험도 요약
-
-===== SUMMARY =====
-Image: d.png
-mm_per_pixel: 0.05
----- NOW ----
-S_now = 0.441
-P_now = 0.283
-R_now = 0.386, Level=B
----- FUTURE ----
-S_future = 0.478
-P_future = 0.270
-R_future = 0.405, Level=C
----- Δ(변화량) ----
-ΔS = +0.036
-ΔR = +0.019
-
-[STEP 7/7] 전체 파이프라인 완료
-```
 
 # LICENSE
 
