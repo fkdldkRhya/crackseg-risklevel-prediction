@@ -21,6 +21,8 @@ _(YOLOv8 Segmentation + Vizuara UNet + Future-mask UNet All-in-one)_
 
 ---
 
+![image](./system.png)
+
 ## 0. 전체 파이프라인 개요
 
 이 리포지토리는 **단일 스크립트** `risklevel_prediction.py` 안에서  
