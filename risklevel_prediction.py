@@ -1,18 +1,6 @@
-# main_yolo_unet_future_allinone.py
-# - 1) YOLOv8 세그멘테이션으로 ROI 마스크 생성
-# - 2) Vizuara UNet으로 전체 크랙 확률맵(prob_map) 생성
-# - 3) YOLO ROI 마스크로 UNet 확률맵을 boost (신뢰도 기반 가중치 앙상블)
-#      -> Final_Prob = clip(UNet_Prob + YOLO_BOOST_ALPHA * YOLO_Mask, 0, 1)
-#      -> Final_Prob를 GMM에 넣어 이진화 → base now 마스크
-# - 4) 원형/잡음 제거 → 최종 now 마스크
-# - 5) 최종 now 마스크를 future-mask UNet에 넣어 미래 크랙 마스크 예측
-# - 6) 미래 마스크에 대해: 글로벌 + 컴포넌트별 위험도 분석
-# - 7) 미래 마스크들을 OR 합한 결과가 최종 미래 크랙 예측 마스크
-
 import os
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple, List, Dict
-from collections import defaultdict
+from typing import Literal, Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -22,11 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from PIL import Image
-from torchvision import transforms
-from huggingface_hub import hf_hub_download
+from torchvision import transforms, models
 from sklearn.mixture import GaussianMixture
-from ultralytics import YOLO
-
 
 # ============================================================
 # 0. GLOBAL CONFIG & CONSTANTS
@@ -35,25 +20,17 @@ from ultralytics import YOLO
 OUT_DIR: str = "out"
 DEFAULT_MM_PER_PIXEL: float = 1.0
 
-# ---- Vizuara UNet (현재 마스크용) ----
-VIZUARA_REPO_ID = "Vizuara/unet-crack-segmentation"
-VIZUARA_FILENAME = "unet_weights_v2.pth"
-VIZUARA_IMG_H = 256
-VIZUARA_IMG_W = 256
-
-# ---- YOLOv8 (ROI 세그멘테이션용) ----
-YOLO_REPO_ID = "OpenSistemas/YOLOv8-crack-seg"   # 필요 시 수정
-YOLO_WEIGHT_FILENAME = "yolov8x/weights/best.pt"  # HF 안의 실제 파일명에 맞게 수정
-YOLO_CONF = 0.25
-YOLO_IMGSZ = 1024
-
-# ---- YOLO → UNet 확률맵 boost 계수 (앙상블 강도) ----
-YOLO_BOOST_ALPHA: float = 0.30   # 예: Final_Prob = UNET_PROB + 0.3 * YOLO_MASK
+# ---- UNet16(VGG16) 설정 ----
+UNET_INPUT_SIZE = (448, 448)  # (W, H)
+CHANNEL_MEANS = [0.485, 0.456, 0.406]
+CHANNEL_STDS = [0.229, 0.224, 0.225]
+UNET_VGG16_MODEL_PATH = "model_unet_vgg_16_best.pt"  # 필요 시 경로 수정
 
 # ---- 미래 마스크 UNet (future_mask_unet_h4_v2.pth) ----
-FUTURE_TILE_DEFAULT: int   = 128
+FUTURE_TILE_DEFAULT: int = 128
 FUTURE_STRIDE_DEFAULT: int = 64
 FUTURE_PRED_THRESH_DEFAULT: float = 0.5
+FUTURE_MODEL_PATH = "future_mask_unet_h4_v2.pth"
 
 # ---- Severity 기준값 (논문 기반) ----
 WIDTH_T0_MM: float = 0.30
@@ -77,19 +54,18 @@ RISK_THRESH_B: float = 0.4
 RISK_THRESH_C: float = 0.7
 
 # ---- Severity/Probability/Risk 가중치 ----
-SEV_WEIGHT_WIDTH: float   = 1.0
+SEV_WEIGHT_WIDTH: float = 1.0
 SEV_WEIGHT_DENSITY: float = 1.0
-SEV_WEIGHT_AREA: float    = 1.0
+SEV_WEIGHT_AREA: float = 1.0
 SEV_WEIGHT_FRACTAL: float = 1.0
-SEV_WEIGHT_LENGTH: float  = 1.0
+SEV_WEIGHT_LENGTH: float = 1.0
 
-PROB_WEIGHT_TIP: float        = 1.0
+PROB_WEIGHT_TIP: float = 1.0
 PROB_WEIGHT_WIDTH_GRAD: float = 1.0
-PROB_WEIGHT_ORIENT: float     = 1.0
+PROB_WEIGHT_ORIENT: float = 1.0
 
 RISK_WEIGHT_S: float = 0.65
 RISK_WEIGHT_P: float = 0.35
-
 
 # ---- 크랙 모양 필터링 기준 (원형/잡음 제거용) ----
 MIN_COMP_AREA = 50          # 너무 작은 건 제거
@@ -130,135 +106,246 @@ def infer_device() -> torch.device:
 
 
 # ============================================================
-# 2. Vizuara UNet + GMM (현재 마스크)
+# 2. UNet16(VGG16) 정의 (crack_segmentation/unet/unet_transfer.py 기반)
 # ============================================================
 
-class VizuaraUNet(nn.Module):
-    def __init__(self):
-        super(VizuaraUNet, self).__init__()
-
-        def conv_block(in_channels, out_channels):
-            return nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-            )
-
-        self.enc1 = conv_block(3, 64)
-        self.enc2 = conv_block(64, 128)
-        self.enc3 = conv_block(128, 256)
-        self.enc4 = conv_block(256, 512)
-        self.pool = nn.MaxPool2d(2)
-
-        self.bottleneck = conv_block(512, 1024)
-
-        self.upconv4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.dec4 = conv_block(1024, 512)
-
-        self.upconv3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.dec3 = conv_block(512, 256)
-
-        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec2 = conv_block(256, 128)
-
-        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1 = conv_block(128, 64)
-
-        self.conv_last = nn.Conv2d(64, 1, kernel_size=1)
+class Interpolate(nn.Module):
+    def __init__(self, size=None, scale_factor=None, mode='nearest', align_corners=False):
+        super().__init__()
+        self.interp = F.interpolate
+        self.size = size
+        self.mode = mode
+        self.scale_factor = scale_factor
+        self.align_corners = align_corners
 
     def forward(self, x):
-        c1 = self.enc1(x)
-        p1 = self.pool(c1)
-
-        c2 = self.enc2(p1)
-        p2 = self.pool(c2)
-
-        c3 = self.enc3(p2)
-        p3 = self.pool(c3)
-
-        c4 = self.enc4(p3)
-        p4 = self.pool(c4)
-
-        bottleneck = self.bottleneck(p4)
-
-        u4 = self.upconv4(bottleneck)
-        u4 = torch.cat([u4, c4], dim=1)
-        d4 = self.dec4(u4)
-
-        u3 = self.upconv3(d4)
-        u3 = torch.cat([u3, c3], dim=1)
-        d3 = self.dec3(u3)
-
-        u2 = self.upconv2(d3)
-        u2 = torch.cat([u2, c2], dim=1)
-        d2 = self.dec2(u2)
-
-        u1 = self.upconv1(d2)
-        u1 = torch.cat([u1, c1], dim=1)
-        d1 = self.dec1(u1)
-
-        return torch.sigmoid(self.conv_last(d1))
+        return self.interp(
+            x,
+            size=self.size,
+            scale_factor=self.scale_factor,
+            mode=self.mode,
+            align_corners=self.align_corners,
+        )
 
 
-def crack_edge_boost(image_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray_clahe = clahe.apply(gray)
-
-    sobel3 = cv2.Sobel(gray_clahe, cv2.CV_32F, 1, 0, ksize=3)
-    sobel5 = cv2.Sobel(gray_clahe, cv2.CV_32F, 1, 0, ksize=5)
-    sobel = cv2.addWeighted(sobel3, 0.5, sobel5, 0.5, 0)
-    sobel = cv2.convertScaleAbs(sobel)
-
-    lap = cv2.Laplacian(gray_clahe, cv2.CV_32F, ksize=3)
-    lap = cv2.convertScaleAbs(lap)
-
-    boost = cv2.addWeighted(gray_clahe, 0.6, sobel, 0.3, 0)
-    boost = cv2.addWeighted(boost, 1.0, lap, 0.2, 0)
-    boost_rgb = cv2.cvtColor(boost, cv2.COLOR_GRAY2BGR)
-    return boost_rgb
+def conv3x3(in_channels, out_channels):
+    return nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
 
-def load_vizuara_unet(device: torch.device) -> VizuaraUNet:
-    print(f"[INFO] Loading Vizuara UNet weights from HF: {VIZUARA_REPO_ID}/{VIZUARA_FILENAME}")
-    weights_path = hf_hub_download(
-        repo_id=VIZUARA_REPO_ID,
-        filename=VIZUARA_FILENAME,
-    )
-    print(f"[INFO] UNet weights downloaded at: {weights_path}")
-    model = VizuaraUNet().to(device)
-    state = torch.load(weights_path, map_location=device)
-    model.load_state_dict(state)
+class ConvRelu(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = conv3x3(in_channels, out_channels)
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.activation(self.conv(x))
+
+
+class DecoderBlockV2(nn.Module):
+    def __init__(self, in_channels, middle_channels, out_channels, is_deconv=True):
+        super().__init__()
+        if is_deconv:
+            # checkerboard artifact 방지를 위한 설정 (원 코드와 동일)
+            self.block = nn.Sequential(
+                ConvRelu(in_channels, middle_channels),
+                nn.ConvTranspose2d(
+                    middle_channels,
+                    out_channels,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                ),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.block = nn.Sequential(
+                Interpolate(scale_factor=2, mode="bilinear", align_corners=False),
+                ConvRelu(in_channels, middle_channels),
+                ConvRelu(middle_channels, out_channels),
+            )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UNet16(nn.Module):
+    def __init__(self, num_classes: int = 1, num_filters: int = 32,
+                 pretrained: bool = False, is_deconv: bool = False):
+        """
+        :param num_classes:
+        :param num_filters:
+        :param pretrained: True 이면 VGG16 encoder를 ImageNet으로 pretrain된 weight 사용
+        :param is_deconv: decoder 업샘플 방식 선택
+        """
+        super().__init__()
+        self.num_classes = num_classes
+
+        self.pool = nn.MaxPool2d(2, 2)
+
+        encoder = models.vgg16(pretrained=pretrained).features
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv1 = nn.Sequential(
+            encoder[0],
+            self.relu,
+            encoder[2],
+            self.relu,
+        )
+
+        self.conv2 = nn.Sequential(
+            encoder[5],
+            self.relu,
+            encoder[7],
+            self.relu,
+        )
+
+        self.conv3 = nn.Sequential(
+            encoder[10],
+            self.relu,
+            encoder[12],
+            self.relu,
+            encoder[14],
+            self.relu,
+        )
+
+        self.conv4 = nn.Sequential(
+            encoder[17],
+            self.relu,
+            encoder[19],
+            self.relu,
+            encoder[21],
+            self.relu,
+        )
+
+        self.conv5 = nn.Sequential(
+            encoder[24],
+            self.relu,
+            encoder[26],
+            self.relu,
+            encoder[28],
+            self.relu,
+        )
+
+        self.center = DecoderBlockV2(512, num_filters * 8 * 2, num_filters * 8, is_deconv)
+
+        self.dec5 = DecoderBlockV2(512 + num_filters * 8, num_filters * 8 * 2, num_filters * 8, is_deconv)
+        self.dec4 = DecoderBlockV2(512 + num_filters * 8, num_filters * 8 * 2, num_filters * 8, is_deconv)
+        self.dec3 = DecoderBlockV2(256 + num_filters * 8, num_filters * 4 * 2, num_filters * 2, is_deconv)
+        self.dec2 = DecoderBlockV2(128 + num_filters * 2, num_filters * 2 * 2, num_filters, is_deconv)
+        self.dec1 = ConvRelu(64 + num_filters, num_filters)
+        self.final = nn.Conv2d(num_filters, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        conv1 = self.conv1(x)
+        conv2 = self.conv2(self.pool(conv1))
+        conv3 = self.conv3(self.pool(conv2))
+        conv4 = self.conv4(self.pool(conv3))
+        conv5 = self.conv5(self.pool(conv4))
+
+        center = self.center(self.pool(conv5))
+
+        dec5 = self.dec5(torch.cat([center, conv5], dim=1))
+        dec4 = self.dec4(torch.cat([dec5, conv4], dim=1))
+        dec3 = self.dec3(torch.cat([dec4, conv3], dim=1))
+        dec2 = self.dec2(torch.cat([dec3, conv2], dim=1))
+        dec1 = self.dec1(torch.cat([dec2, conv1], dim=1))
+
+        if self.num_classes > 1:
+            x_out = F.log_softmax(self.final(dec1), dim=1)
+        else:
+            x_out = self.final(dec1)  # sigmoid는 forward 밖에서 적용
+        return x_out
+
+
+# ============================================================
+# 3. UNet16(VGG16) 로더 + 확률맵 생성 (원본 inference_unet.py와 동일한 전처리)
+# ============================================================
+
+def load_unet_vgg16(model_path: str, device: torch.device) -> UNet16:
+    """
+    crack_segmentation/utils.py 의 load_unet_vgg16 을 반영:
+      - model = UNet16(pretrained=True)
+      - checkpoint['model'] 또는 checkpoint['state_dict'] 사용
+    """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"UNet16 weight not found: {model_path}")
+
+    print(f"[INFO] Loading UNet16(VGG16) weights from: {model_path}")
+    model = UNet16(num_classes=1, num_filters=32, pretrained=True, is_deconv=False)
+
+    ckpt = torch.load(model_path, map_location="cpu")
+
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state = ckpt["model"]
+    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        # utils.py에는 오타(check_point)가 있지만, 여기서는 올바르게 state_dict 사용
+        state = ckpt["state_dict"]
+    else:
+        raise RuntimeError("Unknown checkpoint format: 'model' or 'state_dict' key not found")
+
+    # DataParallel 대비 "module." prefix 제거
+    new_state = {}
+    for k, v in state.items():
+        if k.startswith("module."):
+            new_state[k[len("module."):]] = v
+        else:
+            new_state[k] = v
+
+    missing, unexpected = model.load_state_dict(new_state, strict=False)
+    print(f"[INFO] load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}")
+    if missing:
+        print("       missing keys (first 10):", missing[:10])
+    if unexpected:
+        print("       unexpected keys (first 10):", unexpected[:10])
+
+    model.to(device)
     model.eval()
     return model
 
 
-def run_unet_prob_map(
-    model: VizuaraUNet,
+unet_train_tfms = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(CHANNEL_MEANS, CHANNEL_STDS),
+])
+
+
+def run_unet_vgg16_prob_map(
+    model: UNet16,
     image_bgr: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
-    h, w = image_bgr.shape[:2]
-    boosted = crack_edge_boost(image_bgr)
-    image_rgb = cv2.cvtColor(boosted, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(image_rgb)
+    """
+    inference_unet.py 의 evaluate_img 와 동일한 흐름:
+      - BGR → RGB
+      - (448,448)로 resize
+      - ToTensor + Normalize(mean,std)
+      - model forward + sigmoid
+      - 원본 해상도로 다시 resize
+    """
+    img_height, img_width = image_bgr.shape[:2]
 
-    transform = transforms.Compose(
-        [
-            transforms.Resize((VIZUARA_IMG_H, VIZUARA_IMG_W)),
-            transforms.ToTensor(),
-        ]
-    )
+    # BGR -> RGB
+    img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    input_width, input_height = UNET_INPUT_SIZE
+    img_resized = cv2.resize(img_rgb, (input_width, input_height), cv2.INTER_AREA)
+
+    pil_img = Image.fromarray(img_resized)
 
     with torch.no_grad():
-        inp = transform(pil_img).unsqueeze(0).to(device)
-        pred = model(inp)
-        pred = pred.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
+        X = unet_train_tfms(pil_img)        # ToTensor + Normalize
+        X = X.unsqueeze(0).to(device)       # [1,3,H,W]
+        logits = model(X)                   # [1,1,h,w]
+        prob_small = torch.sigmoid(logits[0, 0]).cpu().numpy().astype(np.float32)
 
-    prob_map = cv2.resize(pred, (w, h), interpolation=cv2.INTER_LINEAR)
+    prob_map = cv2.resize(prob_small, (img_width, img_height), cv2.INTER_AREA)
     return prob_map
 
+
+# ============================================================
+# 4. GMM 기반 이진화 + 모양 필터링
+# ============================================================
 
 def keep_elongated_components(
     mask_u8: np.ndarray,
@@ -339,12 +426,9 @@ def prob_to_binary_gmm(
     image_bgr: np.ndarray,
     n_components: int = 3,
 ) -> np.ndarray:
-    """
-    여기서 들어오는 prob_map은 이미 YOLO 기반 boost가 적용된 Final_Prob.
-    """
     p_min = float(prob_map.min())
     p_max = float(prob_map.max())
-    print(f"[INFO] prob_map(min,max) = ({p_min:.4f}, {p_max:.4f})")
+    print(f"[INFO] prob_map min={p_min:.4f}, max={p_max:.4f}")
 
     if p_max - p_min < 1e-6:
         print("[WARN] prob_map dynamic range 거의 없음 → 빈 마스크 반환")
@@ -382,7 +466,7 @@ def prob_to_binary_gmm(
     gmm = GaussianMixture(
         n_components=n_components,
         covariance_type="full",
-        random_state=42
+        random_state=42,
     )
     gmm.fit(train_feat)
 
@@ -436,154 +520,12 @@ def prob_to_binary_gmm(
     return crack_mask_filled
 
 
-def generate_crack_mask_unet_gmm(
-    image_path: str,
-    model: VizuaraUNet,
-    device: torch.device,
-    yolo_roi_mask: Optional[np.ndarray] = None,
-    yolo_boost: float = YOLO_BOOST_ALPHA,
-) -> np.ndarray:
-    """
-    UNet 확률맵 + (옵션) YOLO ROI 마스크로 boost 한 후
-    GMM 이진화까지 수행해서 base now 마스크 생성.
-    """
-    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if image_bgr is None:
-        raise RuntimeError(f"이미지를 읽을 수 없습니다: {image_path}")
-
-    h, w = image_bgr.shape[:2]
-    print(f"[INFO] Image shape: {w}x{h} (WxH)")
-
-    print("[INFO] Running Vizuara UNet inference (prob_map)...")
-    prob_map_unet = run_unet_prob_map(model, image_bgr, device)
-
-    # --- YOLO 기반 확률 boost (옵션 2: 신뢰도 기반 가중치 앙상블) ---
-    if yolo_roi_mask is not None:
-        print(f"[INFO] Applying YOLO-based prob boosting (alpha={yolo_boost:.3f})")
-        # YOLO 마스크가 다른 크기면 resize
-        if yolo_roi_mask.shape != prob_map_unet.shape:
-            yolo_resized = cv2.resize(
-                yolo_roi_mask.astype(np.uint8),
-                (w, h),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        else:
-            yolo_resized = yolo_roi_mask.astype(np.uint8)
-
-        yolo_float = (yolo_resized > 0).astype(np.float32)  # 0/1 mask
-        prob_map_final = prob_map_unet + yolo_boost * yolo_float
-        prob_map_final = np.clip(prob_map_final, 0.0, 1.0)
-    else:
-        print("[INFO] YOLO ROI mask is None → UNet prob_map만 사용")
-        prob_map_final = prob_map_unet
-
-    # 디버그용 확률맵 저장
-    ensure_out_dir()
-    cv2.imwrite(
-        out_path(image_path, "_unet_prob_raw"),
-        (np.clip(prob_map_unet, 0.0, 1.0) * 255).astype(np.uint8),
-    )
-    cv2.imwrite(
-        out_path(image_path, "_unet_prob_boosted"),
-        (np.clip(prob_map_final, 0.0, 1.0) * 255).astype(np.uint8),
-    )
-
-    print("[INFO] Running GMM clustering on [Final_Prob, edge] features...")
-    bin_mask = prob_to_binary_gmm(
-        prob_map_final,
-        image_bgr,
-        n_components=3,
-    )
-
-    bin_mask = (bin_mask > 0).astype(np.uint8)
-
-    mask_path = out_path(image_path, "_now_base_mask")
-    cv2.imwrite(mask_path, bin_mask * 255)
-    print(f"[INFO] Saved base now crack mask (UNet+YOLO ensemble+GMM) to: {mask_path}")
-
-    overlay = image_bgr.copy()
-    overlay[bin_mask > 0] = (0, 0, 255)
-    blended = cv2.addWeighted(image_bgr, 0.7, overlay, 0.3, 0)
-    overlay_path = out_path(image_path, "_now_base_overlay")
-    cv2.imwrite(overlay_path, blended)
-    print(f"[INFO] Saved base now overlay to: {overlay_path}")
-
-    return bin_mask
-
-
-# ============================================================
-# 3. YOLOv8 세그멘테이션 기반 ROI 마스크
-# ============================================================
-
-def load_yolo_from_hf(device_str: str) -> YOLO:
-    print(f"[INFO] Downloading YOLOv8 weights from HF: {YOLO_REPO_ID}/{YOLO_WEIGHT_FILENAME}")
-    weight_path = hf_hub_download(
-        repo_id=YOLO_REPO_ID,
-        filename=YOLO_WEIGHT_FILENAME,
-    )
-    print(f"[INFO] YOLO weights at: {weight_path}")
-    model = YOLO(weight_path)
-    model.to(device_str)
-    return model
-
-
-def generate_yolo_roi_mask_seg(
-    image_path: str,
-    yolo_model: YOLO,
-) -> np.ndarray:
-    """
-    YOLOv8-seg 결과의 mask들을 모두 OR한 ROI 마스크 생성 (0/1)
-    """
-    img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise FileNotFoundError(f"이미지를 열 수 없습니다: {image_path}")
-    H, W = img_bgr.shape[:2]
-
-    print(f"[INFO] Running YOLOv8 segmentation (conf={YOLO_CONF}, imgsz={YOLO_IMGSZ})")
-    results = yolo_model(
-        image_path,
-        conf=YOLO_CONF,
-        imgsz=YOLO_IMGSZ,
-        verbose=False,
-    )
-    if len(results) == 0:
-        print("[INFO] YOLO 결과 없음 → ROI 마스크는 0")
-        return np.zeros((H, W), dtype=np.uint8)
-
-    r = results[0]
-    if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
-        print("[INFO] YOLO masks 없음 → ROI 마스크는 0")
-        return np.zeros((H, W), dtype=np.uint8)
-
-    masks = r.masks.data.cpu().numpy()  # (N, Hm, Wm), 0~1
-    union = (masks.sum(axis=0) > 0.5).astype(np.uint8)
-    # YOLO가 리사이즈 했을 수 있으니 원본 사이즈로 보간
-    roi_mask = cv2.resize(union, (W, H), interpolation=cv2.INTER_NEAREST)
-
-    ensure_out_dir()
-    cv2.imwrite(out_path(image_path, "_yolo_roi_mask"), roi_mask * 255)
-
-    overlay = img_bgr.copy()
-    overlay[roi_mask > 0] = (0, 255, 0)
-    blended = cv2.addWeighted(img_bgr, 0.7, overlay, 0.3, 0)
-    cv2.imwrite(out_path(image_path, "_yolo_roi_overlay"), blended)
-    print("[INFO] Saved YOLO ROI mask & overlay.")
-
-    print(f"[INFO] YOLO ROI fg_ratio={float(roi_mask.mean()):.4f}")
-
-    return roi_mask
-
-
-# ============================================================
-# 4. 크랙 모양 필터링 (원형/잡음 제거)
-# ============================================================
-
 def filter_crack_like_components(
     combined_mask: np.ndarray,
     image_path: str,
 ) -> np.ndarray:
     """
-    GMM으로 얻은 base now 마스크에서:
+    UNet 마스크에서:
       - 너무 작은 것
       - 거의 원형에 가까운 blob
       - 짧고 aspect 낮은 것
@@ -631,8 +573,8 @@ def filter_crack_like_components(
     print(f"[INFO] filter_crack_like_components: {num_labels-1} comps -> {keep_count} kept")
 
     ensure_out_dir()
-    cv2.imwrite(out_path(image_path, "_now_mask_raw"), m * 255)
-    cv2.imwrite(out_path(image_path, "_now_mask_filtered"), out * 255)
+    cv2.imwrite(out_path(image_path, "_unet_mask_raw"), m * 255)
+    cv2.imwrite(out_path(image_path, "_unet_mask_filtered"), out * 255)
 
     return out
 
@@ -644,10 +586,12 @@ def filter_crack_like_components(
 def skeletonize_cv(crack_mask: np.ndarray) -> np.ndarray:
     m = preprocess_crack_mask(crack_mask)
 
+    # OpenCV ximgproc thinning이 있으면 그걸 사용
     if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
         skel = cv2.ximgproc.thinning(m)
         return (skel > 0).astype(np.uint8)
 
+    # 없으면 간단한 수동 skeletonization
     skel = np.zeros_like(m)
     element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
@@ -1239,15 +1183,13 @@ def analyze_components(
         rr = analyze_mask(image_path, comp, mm_per_pixel, tag=tag)
         results.append(rr)
 
-        # ----- 각 크랙마다 ROI bbox 이미지 저장 -----
+        # 각 컴포넌트별 bbox 시각화
         if base_img is not None:
             comp_overlay = base_img.copy()
 
-            # 크랙 픽셀 빨간색으로 표시
             yy, xx = np.where(comp > 0)
             comp_overlay[yy, xx] = (0, 0, 255)
 
-            # bounding box (초록색)
             cv2.rectangle(
                 comp_overlay,
                 (x, y),
@@ -1256,10 +1198,8 @@ def analyze_components(
                 2,
             )
 
-            # 파일 저장: <이미지이름>_{tag}_bbox.png
             cv2.imwrite(out_path(image_path, f"_{tag}_bbox"), comp_overlay)
 
-            # 전체 bbox 한 장에 모으는 overlay에도 bbox 추가
             if combined_overlay is not None:
                 cv2.rectangle(
                     combined_overlay,
@@ -1269,7 +1209,6 @@ def analyze_components(
                     2,
                 )
 
-    # 전체 컴포넌트 bbox만 모은 이미지도 저장
     if combined_overlay is not None:
         cv2.imwrite(
             out_path(image_path, f"_{tag_prefix}_components_bbox_all"),
@@ -1442,50 +1381,52 @@ def predict_future_mask_tiled(
 
 
 # ============================================================
-# 7. 메인 파이프라인 (하드코딩 버전)
+# 7. 메인 파이프라인 (YOLO 제거 + UNet16(VGG16)만 사용)
 # ============================================================
 
 def run_pipeline():
-    # ======== 여기를 너 환경에 맞게 수정 =========
-    IMAGE_PATH = "a.png"                    # 분석할 이미지
-    MM_PER_PIXEL = DEFAULT_MM_PER_PIXEL     # mm/px
-    FUTURE_MODEL_PATH = "future_mask_unet_h4_v2.pth"  # 미래 UNet 가중치 경로
+    # ======== 여기를 환경에 맞게 수정 =========
+    IMAGE_PATH = "b.png"                    # 분석할 이미지 파일명
+    MM_PER_PIXEL = DEFAULT_MM_PER_PIXEL     # 이미지 스케일 (mm/px)
     # ======================================
 
     ensure_out_dir()
 
     device = infer_device()
-    device_str = "cuda" if device.type == "cuda" else ("mps" if device.type == "mps" else "cpu")
     print(f"[INFO] Using device: {device}")
 
     if not os.path.exists(IMAGE_PATH):
         raise FileNotFoundError(f"이미지를 찾을 수 없습니다: {IMAGE_PATH}")
 
-    # 1) 모델 로딩 (YOLO, Vizuara UNet, Future UNet)
-    yolo_model = load_yolo_from_hf(device_str=device_str)
-    viz_unet = load_vizuara_unet(device)
+    # 1) 모델 로딩 (UNet16 VGG, Future UNet)
+    unet_model = load_unet_vgg16(UNET_VGG16_MODEL_PATH, device)
     future_unet = load_future_unet(FUTURE_MODEL_PATH, device)
 
-    # 2) YOLO ROI 마스크
-    yolo_roi_mask = generate_yolo_roi_mask_seg(IMAGE_PATH, yolo_model)
+    # 2) 이미지 로딩
+    image_bgr = cv2.imread(IMAGE_PATH, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise RuntimeError(f"이미지를 읽을 수 없습니다: {IMAGE_PATH}")
 
-    # 3) UNet+YOLO 확률 앙상블 + GMM → base now 마스크
-    unet_now_mask = generate_crack_mask_unet_gmm(
-        IMAGE_PATH,
-        viz_unet,
-        device=device,
-        yolo_roi_mask=yolo_roi_mask,
-        yolo_boost=YOLO_BOOST_ALPHA,
-    )
+    h, w = image_bgr.shape[:2]
+    print(f"[INFO] Image shape: {w}x{h} (WxH)")
+
+    # 3) UNet16(VGG16) + GMM으로 현재(now) 마스크 생성
+    print("[INFO] Running UNet16(VGG16) inference...")
+    prob_map = run_unet_vgg16_prob_map(unet_model, image_bgr, device)
+
+    ensure_out_dir()
+    cv2.imwrite(out_path(IMAGE_PATH, "_unet_prob"), (prob_map * 255).astype(np.uint8))
+
+    print("[INFO] Running GMM clustering on [prob, edge] features...")
+    unet_mask_bin = prob_to_binary_gmm(prob_map, image_bgr, n_components=3)
 
     # 4) 원형/잡음 제거 → 최종 now 마스크
-    final_now_mask = filter_crack_like_components(unet_now_mask, IMAGE_PATH)
+    final_now_mask = filter_crack_like_components(unet_mask_bin, IMAGE_PATH)
 
     # 최종 now 오버레이 저장
-    img_bgr = cv2.imread(IMAGE_PATH, cv2.IMREAD_COLOR)
-    now_overlay = img_bgr.copy()
+    now_overlay = image_bgr.copy()
     now_overlay[final_now_mask > 0] = (0, 0, 255)
-    blended_now = cv2.addWeighted(img_bgr, 0.7, now_overlay, 0.3, 0)
+    blended_now = cv2.addWeighted(image_bgr, 0.7, now_overlay, 0.3, 0)
     cv2.imwrite(out_path(IMAGE_PATH, "_now_final_overlay"), blended_now)
 
     # 5) 글로벌 now 위험도 분석
@@ -1517,9 +1458,9 @@ def run_pipeline():
     cv2.imwrite(out_path(IMAGE_PATH, "_future_prob"), (future_prob * 255).astype(np.uint8))
     cv2.imwrite(out_path(IMAGE_PATH, "_future_mask"), future_bin * 255)
 
-    future_overlay = img_bgr.copy()
+    future_overlay = image_bgr.copy()
     future_overlay[future_bin > 0] = (255, 0, 0)
-    blended_future = cv2.addWeighted(img_bgr, 0.7, future_overlay, 0.3, 0)
+    blended_future = cv2.addWeighted(image_bgr, 0.7, future_overlay, 0.3, 0)
     cv2.imwrite(out_path(IMAGE_PATH, "_future_final_overlay"), blended_future)
 
     print("\n[INFO] 미래 예측 요약")
